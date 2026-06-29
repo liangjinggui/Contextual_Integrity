@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 """
 
 import os
+import argparse
 from typing import Any, Dict, Optional, Tuple, List
 from litellm import batch_completion, completion_cost
 import json
@@ -109,11 +110,55 @@ def decode_json_response(response):
         return None
 
 
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Generate CIMemories persona gold labels (native OpenAI API)."
+    )
+    p.add_argument(
+        "--model",
+        default="gpt-5",
+        help="Model name, routed via litellm as openai/<model>. Default: gpt-5",
+    )
+    p.add_argument(
+        "--num-profiles",
+        type=int,
+        default=None,
+        help="Only label the first N profiles (for cheap test runs). Default: all.",
+    )
+    p.add_argument(
+        "--n-samples",
+        type=int,
+        default=10,
+        help="Samples per (profile, context, persona). Default: 10.",
+    )
+    p.add_argument(
+        "--input",
+        default="./data_openai_gpt-oss-120b.json",
+        help="Input profiles JSON. Default: ./data_openai_gpt-oss-120b.json",
+    )
+    p.add_argument(
+        "--output-prefix",
+        default="./data_openai_gpt-oss-120b_gold_labelled_personas",
+        help=(
+            "Output path prefix; writes <prefix>.json (per-persona) and "
+            "<prefix>_combined.json. Default: ./data_openai_gpt-oss-120b_gold_labelled_personas"
+        ),
+    )
+    return p.parse_args()
+
+
+args = parse_args()
+
 models = [
-    Model("gpt-5"),
+    Model(args.model),
 ]
 
-data = json.load(open("./data_openai_gpt-oss-120b.json"))
+per_persona_path = f"{args.output_prefix}.json"
+combined_path = f"{args.output_prefix}_combined.json"
+
+data = json.load(open(args.input))
+if args.num_profiles is not None:
+    data = data[: args.num_profiles]
 total_cost = 0.0
 pbar = tqdm(models, leave=False)
 for model in pbar:
@@ -124,7 +169,9 @@ for model in pbar:
             pbar4 = tqdm(personas, leave=False)
             for persona in pbar4:
                 pbar.set_description(f"COST: ${total_cost:.4f}")
-                labels, cost = label_attributes(model, persona, profile, context, n=10)
+                labels, cost = label_attributes(
+                    model, persona, profile, context, n=args.n_samples
+                )
                 labels = [decode_json_response(label) for label in labels]
                 labels = [label for label in labels if label is not None]
                 memories = set(
@@ -169,9 +216,7 @@ for model in pbar:
                     )
                 ] = label_distribution
                 total_cost += cost
-                with open(
-                    "./data_openai_gpt-oss-120b_gold_labelled_personas.json", "w"
-                ) as f:
+                with open(per_persona_path, "w") as f:
                     json.dump(data, f, indent=4)
 
 
@@ -179,9 +224,11 @@ profiles_with_labels = data
 
 for profile in profiles_with_labels:
     for context in profile["contexts"]:
-        fundamentalist_labels = context["labels_gpt-5___the_privacy_fundamentalist__"]
-        pragmatic_labels = context["labels_gpt-5___the_pragmatic__"]
-        unconcerned_labels = context["labels_gpt-5__the_unconcerned__"]
+        fundamentalist_labels = context[
+            f"labels_{args.model}___the_privacy_fundamentalist__"
+        ]
+        pragmatic_labels = context[f"labels_{args.model}___the_pragmatic__"]
+        unconcerned_labels = context[f"labels_{args.model}__the_unconcerned__"]
 
         combined_labels = {}
         weights = {"fundamentalist": 0.26, "pragmatic": 0.64, "unconcerned": 0.10}
@@ -207,8 +254,5 @@ for profile in profiles_with_labels:
         context["labels_combined"] = combined_labels
 
 # save updated profiles_with_labels
-with open(
-    "./data_openai_gpt-oss-120b_gold_labelled_personas_combined.json",
-    "w",
-) as f:
+with open(combined_path, "w") as f:
     json.dump(profiles_with_labels, f, indent=2)
