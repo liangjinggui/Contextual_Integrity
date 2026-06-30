@@ -64,9 +64,14 @@ class AsyncModel:
             api_key = os.getenv("AZURE_API_KEY_gpt_5")
             api_version = os.getenv("AZURE_API_VERSION_gpt_5")
         elif "gemini" in name:
-            ep = "gemini/gemini-2.5-flash-preview-05-20"
+            # ep = "gemini/gemini-2.5-flash-preview-05-20"  # original (hardcoded)
+            ep = f"gemini/{name}"
         elif "claude" in name:
             ep = f"bedrock/{name}"
+        elif "deepseek" in name:
+            # DeepSeek official API (litellm reads DEEPSEEK_API_KEY from env).
+            # Intercepts deepseek names here instead of the local-vLLM else-branch.
+            ep = f"deepseek/{name}"
         else:
             ep = f"hosted_vllm/{name}"
             api_base = f"http://{host}:{port}/v1"
