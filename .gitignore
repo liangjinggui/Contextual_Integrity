@@ -185,3 +185,5 @@ cython_debug/
 /run_scripts/apis.sh
 /.claude
 /brainstorming
+figs/
+outputs/
