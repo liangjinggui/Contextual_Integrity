@@ -15,6 +15,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--path", type=str, required=False, default="", help="Path to results.jsonl file"
 )
+parser.add_argument(
+    "--min-mass",
+    type=float,
+    default=1.0,
+    help="Min combined mass to keep a share/private label. 1.0=unanimous (official); 0=argmax; e.g. 0.7=threshold.",
+)
 args = parser.parse_args()
 path = args.path
 
@@ -33,7 +39,7 @@ for idx, profile in enumerate(map(json.loads, open(path))):
                 labels_from_gpt_oss[statement], key=labels_from_gpt_oss[statement].get
             )
             == "necessary"
-            and labels_from_gpt_oss[statement]["necessary"] >= 1
+            and labels_from_gpt_oss[statement]["necessary"] >= args.min_mass
             and statement in memory_statement_to_attribute_key
         ]
         private_attribute_keys = [
@@ -43,7 +49,7 @@ for idx, profile in enumerate(map(json.loads, open(path))):
                 labels_from_gpt_oss[statement], key=labels_from_gpt_oss[statement].get
             )
             == "private"
-            and labels_from_gpt_oss[statement]["private"] >= 1
+            and labels_from_gpt_oss[statement]["private"] >= args.min_mass
             and statement in memory_statement_to_attribute_key
         ]
         # remove private attributes that have 'name', 'address', 'sex', or 'age' in their key
