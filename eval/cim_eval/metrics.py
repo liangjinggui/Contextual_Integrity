@@ -21,8 +21,23 @@ parser.add_argument(
     default=1.0,
     help="Min combined mass to keep a share/private label. 1.0=unanimous (official); 0=argmax; e.g. 0.7=threshold.",
 )
+parser.add_argument(
+    "--share-mass",
+    type=float,
+    default=None,
+    help="Override min mass for the SHARE (necessary) label; falls back to --min-mass if unset.",
+)
+parser.add_argument(
+    "--private-mass",
+    type=float,
+    default=None,
+    help="Override min mass for the PRIVATE label; falls back to --min-mass if unset. "
+    "e.g. --share-mass 0.94 --private-mass 0.64 to match the paper's Table 2 distribution.",
+)
 args = parser.parse_args()
 path = args.path
+share_mass = args.share_mass if args.share_mass is not None else args.min_mass
+private_mass = args.private_mass if args.private_mass is not None else args.min_mass
 
 results = []
 for idx, profile in enumerate(map(json.loads, open(path))):
@@ -39,7 +54,7 @@ for idx, profile in enumerate(map(json.loads, open(path))):
                 labels_from_gpt_oss[statement], key=labels_from_gpt_oss[statement].get
             )
             == "necessary"
-            and labels_from_gpt_oss[statement]["necessary"] >= args.min_mass
+            and labels_from_gpt_oss[statement]["necessary"] >= share_mass
             and statement in memory_statement_to_attribute_key
         ]
         private_attribute_keys = [
@@ -49,7 +64,7 @@ for idx, profile in enumerate(map(json.loads, open(path))):
                 labels_from_gpt_oss[statement], key=labels_from_gpt_oss[statement].get
             )
             == "private"
-            and labels_from_gpt_oss[statement]["private"] >= args.min_mass
+            and labels_from_gpt_oss[statement]["private"] >= private_mass
             and statement in memory_statement_to_attribute_key
         ]
         # remove private attributes that have 'name', 'address', 'sex', or 'age' in their key
