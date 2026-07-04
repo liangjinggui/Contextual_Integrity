@@ -68,14 +68,15 @@ class AsyncModel:
             ep = f"gemini/{name}"
         elif "claude" in name:
             ep = f"bedrock/{name}"
-        elif "deepseek" in name:
+        elif name in ("deepseek-reasoner", "deepseek-chat"):
             # DeepSeek official API (litellm reads DEEPSEEK_API_KEY from env).
-            # Intercepts deepseek names here instead of the local-vLLM else-branch.
+            # Only the API aliases route here; self-hosted models (e.g.
+            # deepseek-ai/DeepSeek-R1-Distill-Qwen-32B) fall through to hosted_vllm.
             ep = f"deepseek/{name}"
         else:
             ep = f"hosted_vllm/{name}"
             api_base = f"http://{host}:{port}/v1"
-        kw = {"timeout": 300, "num_retries": 5}
+        kw = {"timeout": 600, "num_retries": 5}
         if api_base:
             kw["api_base"] = api_base
         if api_key:
@@ -84,6 +85,10 @@ class AsyncModel:
             kw["api_version"] = api_version
         if greedy:
             kw["temperature"] = 0
+        if "qwen" in name.lower():
+            # Qwen3 hybrid models: disable thinking so message.content is the
+            # final answer (not consumed by an unbounded <think> chain).
+            kw["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         return ep, kw
 
     async def raw(self, prompt: str):
