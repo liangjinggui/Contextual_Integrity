@@ -375,6 +375,64 @@ async def amain(a):
     log.info(
         f"model={a.model_name} strong={a.strong_model_name} concurrency={a.concurrency}"
     )
+    if a.rejudge:
+        # Reuse an existing results.jsonl (--data_file): skip target generation
+        # (Stage A) and only re-run the REVEAL judge (Stage B) on the stored
+        # responses. Lets you swap judges without regenerating. Saves to a new
+        # <model>_rejudge/<ts>/ dir; the original results file is left untouched.
+        strong = AsyncModel(
+            a.strong_model_name,
+            greedy=True,
+            port=a.strong_model_port,
+            host=a.strong_model_host,
+        )
+        try:
+            await strong.raw("Just say hi!")
+        except Exception as e:
+            log.error(f"Health check failed: {e}")
+            return
+        log.info("Rejudge mode: reuse existing generations, re-run judge only")
+        P = load_prompts(a.prompts_file, a.privacy_prompts_level)
+        data = load_profiles(a.data_file, a.num_profiles)
+        sem = asyncio.Semaphore(max(1, a.concurrency))
+        costs = CostTracker()
+        prog = Progress(costs, a.log_interval)
+        rev_prompts, rev_refs = [], []
+        for prof in data:
+            mem = memory_map(prof)
+            names = info_attr_names(prof)
+            for ctx in prof.get("contexts") or []:
+                for k in [key for key in ctx if key.startswith("combination_")]:
+                    ms = ctx[k].get("model_solution") or {}
+                    sol = ms.get("response_solution") or ""
+                    attrs = list(ms.get("revealed_attributes", {}).keys()) or names
+                    rev_prompts.append(
+                        P["adversary_reveal"].format(
+                            attributes="\n".join(attr_lines(attrs, mem)), solution=sol
+                        )
+                    )
+                    rev_refs.append((ctx, k, attrs))
+        await prog.set_total(len(rev_prompts))
+        log.info(f"Rejudge: {len(rev_prompts)} reveal calls")
+        rev_out = await run_calls(rev_prompts, strong, sem, prog, costs, "reveal")
+        for (ctx, k, attrs), rv in zip(rev_refs, rev_out):
+            b = ctx.setdefault(k, {}).setdefault("model_solution", {})
+            rj = parse_json(rv or "")
+            b["revealed_attributes"] = {x: 1 if x in rj else 0 for x in attrs}
+            b["revealed_attributes_explanation"] = rj
+        now = t.strftime("%Y_%B_%d_%I:%M:%S_%p")
+        outdir = os.path.join(
+            a.results_dir, a.model_name.replace("/", "_") + "_rejudge", now
+        )
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "results.jsonl"), "w") as f:
+            for prof in data:
+                f.write(json.dumps(prof) + "\n")
+        with open(os.path.join(outdir, "args.json"), "w") as f:
+            json.dump(vars(a), f, indent=2)
+        log.info(f"Saved to {outdir}")
+        os._exit(0)
+
     weak = AsyncModel(
         a.model_name, greedy=a.greedy, port=a.model_port, host=a.model_host
     )
@@ -591,6 +649,12 @@ def main():
         default="full",
     )
     p.add_argument("--num_trials", type=int, default=10)
+    p.add_argument(
+        "--rejudge",
+        action="store_true",
+        help="Reuse the generations in --data_file (an existing results.jsonl) and only "
+        "re-run the REVEAL judge; saves to <model>_rejudge/<ts>/ without touching the original.",
+    )
     p.add_argument("--concurrency", type=int, default=64)
     p.add_argument("--log_interval", type=float, default=1)
     a = p.parse_args()
