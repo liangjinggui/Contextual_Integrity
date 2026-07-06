@@ -19,9 +19,20 @@ Prompt/data helpers are imported from eval.py so the prompt is byte-identical.
 
 import argparse, json, os, time
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
 
 from evaluation.cim_eval.eval import load_prompts, load_profiles, info_attr_names, memory_map, mem_blob
+
+
+class NanGuardLogitsProcessor(LogitsProcessor):
+    """Sanitize inf/nan in the (post-warper) scores so multinomial can't assert on a
+    bad probability tensor. No-op on finite logits (the overwhelming majority): only
+    the rare step that would crash gets nan/-inf -> very negative (effectively filtered)
+    and +inf -> large finite. Masks the symptom of the bf16 forward instability (worse
+    at small batch / large models) so a single bad step no longer kills the whole run."""
+
+    def __call__(self, input_ids, scores):
+        return torch.nan_to_num(scores, nan=-1e9, posinf=1e4, neginf=-1e9)
 
 
 def main():
@@ -130,6 +141,7 @@ def main():
                 top_k=a.top_k,
                 num_return_sequences=a.num_trials,
                 pad_token_id=tok.pad_token_id,
+                logits_processor=LogitsProcessorList([NanGuardLogitsProcessor()]),
             )
         gen = out[:, enc.input_ids.shape[1] :]  # strip the (left-padded) prompt
         dec = tok.batch_decode(gen, skip_special_tokens=True)
