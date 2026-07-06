@@ -26,10 +26,11 @@ def naive_eager_attention(module, query, key, value, attention_mask, scaling, ct
     grp = ctx["mem_key_group"]                                           # (nmem,) attribute idx in [0,M)
     qmask = ctx["query_positions"]                                        # (S,) bool
     k_mem = key_states[:, :, pos, :]                                      # (B,H,nmem,D)
-    PQ, PK = P_Q[grp], P_K[grp]                                           # (nmem,D,D) per memory token
-    qP = torch.einsum("bhsd,nde->bhnse", query, PQ)                       # (B,H,nmem,S,D)
-    kP = torch.einsum("bhnd,nde->bhne", k_mem, PK)                        # (B,H,nmem,D)
-    proj = torch.einsum("bhnse,bhne->bhsn", qP, kP) * scaling             # (B,H,S,nmem) projected score
+    # proj[s,n] = (P_Q q_s)·(P_K k_n) = q_sᵀ (P_Qᵀ P_K) k_n. Fold into one bilinear per
+    # group and contract k first -> avoids the (nmem,S,D) blowup.
+    B_n = torch.matmul(P_Q.transpose(-1, -2), P_K)[grp]                   # (nmem,D,D): P_Qᵀ P_K per token
+    kB = torch.einsum("nde,bhne->bhnd", B_n, k_mem)                       # (B,H,nmem,D)
+    proj = torch.einsum("bhsd,bhnd->bhsn", query, kB) * scaling           # (B,H,S,nmem) projected score
 
     new_attn = attn.clone()
     rows = qmask.nonzero(as_tuple=True)[0]                                # generated/query rows to modify
@@ -78,12 +79,15 @@ class InterventionModel(nn.Module):
     project base q/k into a Gtheta-emitted subspace on generated->memory pairs. At init
     (Gtheta -> P=I) the whole forward equals the base forward (off switch / warm start)."""
 
-    def __init__(self, model_path, band=range(24, 36), rank=8, dtype="bfloat16", device="cuda:0"):
+    def __init__(self, model_path, band=range(24, 36), rank=8, dtype="bfloat16", device="cuda:0",
+                 attn_implementation="eager"):
         super().__init__()
         self.device = device
         td = getattr(torch, dtype)
+        # non-band layers use `attn_implementation` (sdpa saves memory in training); band layers
+        # are always monkeypatched to naive_eager_attention (needs the scores).
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=td, attn_implementation="eager"   # eager so we can read/modify attn weights
+            model_path, dtype=td, attn_implementation=attn_implementation
         ).to(device)
         self.model.requires_grad_(False)
         self.model.eval()
@@ -93,6 +97,7 @@ class InterventionModel(nn.Module):
         self.gtheta = Gtheta(hidden_size=cfg.hidden_size, head_dim=cfg.head_dim,
                              rank=rank, n_layers=len(self.band)).to(device).to(td)
         self._ctx_spans = None
+        self._force_identity = False   # if True, _build_ctx uses P=I (for vanilla/base masses)
         self.last_masses = {}
         for ell in self.band:
             attn = self.model.model.layers[ell].self_attn
@@ -112,10 +117,15 @@ class InterventionModel(nn.Module):
         keys = list(sp["mem"].keys())
         gd = self.gtheta.head.weight.dtype
         i0, i1 = sp["instr"]
-        c = hidden_states[:, i0:i1, :].mean(1)            # (B, hidden), B=1
-        es = [hidden_states[:, s:e, :].mean(1) for (s, e) in (sp["mem"][k] for k in keys)]
-        e = torch.cat(es, 0)                              # (M, hidden)
-        P_Q, P_K = self.gtheta(c.expand(len(keys), -1).to(gd), e.to(gd), self._band_pos[layer_idx])
+        if self._force_identity:                          # vanilla masses: P=I, no gtheta
+            D = self.model.config.head_dim
+            I = torch.eye(D, device=hidden_states.device, dtype=hidden_states.dtype)
+            P_Q = P_K = I.expand(len(keys), D, D)
+        else:
+            c = hidden_states[:, i0:i1, :].mean(1)        # (B, hidden), B=1
+            es = [hidden_states[:, s:e, :].mean(1) for (s, e) in (sp["mem"][k] for k in keys)]
+            e = torch.cat(es, 0)                          # (M, hidden)
+            P_Q, P_K = self.gtheta(c.expand(len(keys), -1).to(gd), e.to(gd), self._band_pos[layer_idx])
         positions, groups = [], []
         for m, k in enumerate(keys):
             t0, t1 = sp["mem"][k]
