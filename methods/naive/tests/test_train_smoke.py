@@ -2,7 +2,7 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 from methods.naive.intervention import InterventionModel
-from methods.naive.data import TargetDataset
+from methods.utils.data import TargetDataset
 from methods.naive.train_naive import train_step
 
 DEV = "cuda:0"

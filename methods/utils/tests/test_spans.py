@@ -1,7 +1,7 @@
 import json
 from transformers import AutoTokenizer
 from evaluation.cim_eval.eval import load_prompts, load_profiles
-from methods.naive.spans import build_intervention_prompt, char_spans, token_spans
+from methods.utils.spans import build_intervention_prompt, char_spans, token_spans
 
 DATA = "data/CIMemories/data/data_openai_gpt-oss-120b_gold_labelled_personas_gemini-3-flash-preview_10profiles_combined_train7.json"
 PROMPTS = "data/CIMemories/eval/prompts.yaml"

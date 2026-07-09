@@ -10,7 +10,7 @@ import torch
 
 from evaluation.cim_eval.eval import load_prompts, load_profiles
 from evaluation.cim_eval.metrics import label_sets
-from methods.naive.spans import build_intervention_prompt, char_spans, token_spans
+from methods.utils.spans import build_intervention_prompt, char_spans, token_spans
 
 
 class TargetDataset:

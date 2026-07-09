@@ -65,7 +65,7 @@ def _patched_attn_forward(im, layer_idx):
             scaling=self.scaling, ctx=ctx,
             dropout=0.0 if not self.training else self.attention_dropout,
         )
-        if ctx is not None:
+        if ctx is not None and not im._gen_mode:          # masses are a training-only signal
             im._record_masses(layer_idx, attn_weights, ctx)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -98,43 +98,87 @@ class InterventionModel(nn.Module):
                              rank=rank, n_layers=len(self.band)).to(device).to(td)
         self._ctx_spans = None
         self._force_identity = False   # if True, _build_ctx uses P=I (for vanilla/base masses)
+        self._gen_mode = False         # generation: compute P once at prefill, cache, reuse at decode
+        self._P_cache = {}             # layer_idx -> (P_Q, P_K, mem_key_positions, mem_key_group)
         self.last_masses = {}
         for ell in self.band:
             attn = self.model.model.layers[ell].self_attn
             attn.forward = types.MethodType(_patched_attn_forward(self, ell), attn)
 
     def set_context(self, mem_tok_spans_per_attr, instr_tok_span, query_positions):
+        """Training: query rows (letter tokens) are present in the single teacher-forced forward."""
         self._ctx_spans = {"mem": mem_tok_spans_per_attr, "instr": instr_tok_span,
                            "qpos": query_positions.to(self.device)}
+        self._gen_mode = False
+
+    def prepare_for_generation(self, mem_tok_spans_per_attr, instr_tok_span):
+        """Generation: call once per context before model.generate(). P is context-fixed, so it is
+        computed from the prompt at PREFILL and cached per band layer; every DECODE step reuses it
+        (query rows aren't known ahead of time -> no qpos here)."""
+        self._ctx_spans = {"mem": mem_tok_spans_per_attr, "instr": instr_tok_span, "qpos": None}
+        self._gen_mode = True
+        self._P_cache = {}
 
     def clear_context(self):
         self._ctx_spans = None
+        self._gen_mode = False
+        self._P_cache = {}
+
+    def _emit_P(self, hidden_states, keys, layer_idx):
+        """Pool instruction + per-memory hidden states -> Gtheta -> (P_Q, P_K), each (M,D,D).
+        hidden_states is one row (B=1); _force_identity short-circuits to P=I (vanilla masses)."""
+        if self._force_identity:
+            D = self.model.config.head_dim
+            I = torch.eye(D, device=hidden_states.device, dtype=hidden_states.dtype)
+            return I.expand(len(keys), D, D), I.expand(len(keys), D, D)
+        sp = self._ctx_spans
+        gd = self.gtheta.head.weight.dtype
+        i0, i1 = sp["instr"]
+        c = hidden_states[:, i0:i1, :].mean(1)            # (1, hidden) instruction repr c^l
+        es = [hidden_states[:, s:e, :].mean(1) for (s, e) in (sp["mem"][k] for k in keys)]
+        e = torch.cat(es, 0)                              # (M, hidden) per-memory repr e_m^l
+        return self.gtheta(c.expand(len(keys), -1).to(gd), e.to(gd), self._band_pos[layer_idx])
+
+    def _flatten_spans(self, keys, dev):
+        """Per-attribute spans -> flat per-token (positions, group idx). group[j] = which of the M
+        attributes memory-token j belongs to, so naive_eager_attention can index P by memory token."""
+        positions, groups = [], []
+        for m, k in enumerate(keys):
+            t0, t1 = self._ctx_spans["mem"][k]
+            positions += list(range(t0, t1)); groups += [m] * (t1 - t0)
+        return (torch.tensor(positions, device=dev), torch.tensor(groups, device=dev))
 
     def _build_ctx(self, hidden_states, layer_idx):
         sp = self._ctx_spans
-        if sp is None or int(sp["qpos"].sum()) == 0 or not sp["mem"]:
-            return None                                   # no query rows / no memory -> vanilla (exact)
+        if sp is None or not sp["mem"]:
+            return None
+        if self._gen_mode:
+            return self._build_ctx_gen(hidden_states, layer_idx)
+        if int(sp["qpos"].sum()) == 0:                    # training: no query rows -> vanilla (exact)
+            return None
         keys = list(sp["mem"].keys())
-        gd = self.gtheta.head.weight.dtype
-        i0, i1 = sp["instr"]
-        if self._force_identity:                          # vanilla masses: P=I, no gtheta
-            D = self.model.config.head_dim
-            I = torch.eye(D, device=hidden_states.device, dtype=hidden_states.dtype)
-            P_Q = P_K = I.expand(len(keys), D, D)
-        else:
-            c = hidden_states[:, i0:i1, :].mean(1)        # (B, hidden), B=1
-            es = [hidden_states[:, s:e, :].mean(1) for (s, e) in (sp["mem"][k] for k in keys)]
-            e = torch.cat(es, 0)                          # (M, hidden)
-            P_Q, P_K = self.gtheta(c.expand(len(keys), -1).to(gd), e.to(gd), self._band_pos[layer_idx])
-        positions, groups = [], []
-        for m, k in enumerate(keys):
-            t0, t1 = sp["mem"][k]
-            positions += list(range(t0, t1)); groups += [m] * (t1 - t0)
+        P_Q, P_K = self._emit_P(hidden_states, keys, layer_idx)
+        pos, grp = self._flatten_spans(keys, hidden_states.device)
+        return {"P_Q": P_Q, "P_K": P_K, "mem_key_positions": pos, "mem_key_group": grp,
+                "query_positions": sp["qpos"].to(hidden_states.device)}
+
+    def _build_ctx_gen(self, hidden_states, layer_idx):
+        """PREFILL (S>1): compute P from the prompt row, cache it per band layer, return None so the
+        prompt attends vanilla (prompt tokens aren't generated tokens). DECODE (S==1): reuse cached P
+        with the single new token as the sole query row. Memory key positions are absolute prompt
+        positions and stay valid across decode steps (the KV cache preserves order)."""
+        keys = list(self._ctx_spans["mem"].keys())
         dev = hidden_states.device
-        return {"P_Q": P_Q, "P_K": P_K,
-                "mem_key_positions": torch.tensor(positions, device=dev),
-                "mem_key_group": torch.tensor(groups, device=dev),
-                "query_positions": sp["qpos"].to(dev)}
+        if hidden_states.shape[1] > 1:
+            P_Q, P_K = self._emit_P(hidden_states[0:1], keys, layer_idx)   # replicas identical -> row 0
+            pos, grp = self._flatten_spans(keys, dev)
+            self._P_cache[layer_idx] = (P_Q, P_K, pos, grp)
+            return None
+        if layer_idx not in self._P_cache:
+            return None
+        P_Q, P_K, pos, grp = self._P_cache[layer_idx]
+        return {"P_Q": P_Q, "P_K": P_K, "mem_key_positions": pos, "mem_key_group": grp,
+                "query_positions": torch.ones(1, dtype=torch.bool, device=dev)}
 
     def _record_masses(self, layer_idx, w, ctx):
         qrows = ctx["query_positions"].nonzero(as_tuple=True)[0]

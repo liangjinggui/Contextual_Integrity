@@ -187,3 +187,4 @@ cython_debug/
 /brainstorming
 figs/
 outputs/
+exp_records/exp_ana/
