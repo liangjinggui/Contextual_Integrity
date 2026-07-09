@@ -1,8 +1,11 @@
 """losses 单测（CPU）：Lorentz 几何性质 + anchor/sup 损失行为。"""
 
 import torch
+import torch.nn.functional as F
 
-from methods.hyper_icl.losses import lorentz_expmap, lorentz_dist, l_h_anchor, l_sup
+from methods.hyper_icl.losses import (
+    lorentz_expmap, lorentz_dist, lorentz_dist_tangent, l_h_anchor, l_sup,
+)
 
 KAPPA = 0.1
 
@@ -33,6 +36,28 @@ def test_expmap_is_radial_isometry():
     o = lorentz_expmap(torch.zeros(1, 8), KAPPA)
     d = lorentz_dist(lorentz_expmap(u, KAPPA), o, KAPPA)
     assert torch.allclose(d, torch.tensor([2.0, 0.5, 5.0]), atol=1e-3)
+
+
+def test_tangent_matches_expmap_path_at_small_scale():
+    """小范数下（无相消区）切空间闭式 == 显式 expmap+dist 路径。"""
+    torch.manual_seed(0)
+    u, v = torch.randn(6, 8), torch.randn(6, 8)
+    want = lorentz_dist(lorentz_expmap(u, KAPPA), lorentz_expmap(v, KAPPA), KAPPA)
+    got = lorentz_dist_tangent(u, v, KAPPA)
+    assert torch.allclose(got, want, atol=1e-4)
+
+
+def test_realistic_scale_no_cancellation():
+    """回归测试（真实量级 d=4096, LN 后 ||u||~64）：旧的经双曲面坐标路径在这里
+    灾难性相消（self-dist 算出 ~73）；切空间闭式必须精确给 0，且不同点给有限合理值。"""
+    torch.manual_seed(0)
+    h = F.layer_norm(torch.randn(5, 4096), (4096,))
+    assert torch.all(lorentz_dist_tangent(h, h, KAPPA) == 0)          # 重合点精确 0
+    h2 = F.layer_norm(torch.randn(5, 4096), (4096,))
+    d = lorentz_dist_tangent(h, h2, KAPPA)
+    assert torch.isfinite(d).all() and (d > 1).all() and (d < 300).all()
+    # anchor 版本：teacher==student 精确 0
+    assert l_h_anchor([h], [h.clone()], KAPPA).item() == 0.0
 
 
 def test_l_h_anchor():

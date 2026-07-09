@@ -40,6 +40,27 @@ def lorentz_dist(p, q, kappa):
     return torch.acosh(arg) / kappa ** 0.5
 
 
+def lorentz_dist_tangent(u, v, kappa):
+    """d_L(exp_o(u), exp_o(v))：直接从切向量算，数值稳定版。u, v: (..., d)。
+
+    经双曲面坐标算内积（lorentz_dist）在大范数下会灾难性相消：d=4096、LN 后
+    ||u||~64 时 p0*q0 ~ 9e17，真值 -1/kappa=-10 是两个 9e17 巨数之差，float32
+    只有 7 位有效数字 -> 误差 ~1e10，重合点算出 dist~73（实测 self-anchor=0.5），
+    梯度全是噪声（这正是首两次训练 anchor 平死的根因）。等价闭式全为正项乘积、
+    无相消：
+        -kappa*<exp_o(u),exp_o(v)>_L = cosh(a-b) + sinh(a)*sinh(b)*||u^-v^||^2/2
+    其中 a=sqrt(k)||u||, b=sqrt(k)||v||，u^,v^ 是单位向量。重合点精确得 dist=0。
+    """
+    u, v = u.float(), v.float()
+    sqrt_k = kappa ** 0.5
+    nu = u.norm(dim=-1, keepdim=True).clamp_min(_EPS)              # (..., 1)
+    nv = v.norm(dim=-1, keepdim=True).clamp_min(_EPS)
+    a, b = sqrt_k * nu, sqrt_k * nv
+    gap_sq = ((u / nu - v / nv) ** 2).sum(-1, keepdim=True)        # ||u^-v^||^2
+    arg = torch.cosh(a - b) + torch.sinh(a) * torch.sinh(b) * gap_sq / 2
+    return (torch.acosh(arg.clamp_min(1.0)) / sqrt_k).squeeze(-1)  # (...,)
+
+
 def l_h_anchor(student_layers, teacher_layers, kappa=0.1):
     """式 16：跨层、跨 token 的双曲锚蒸馏损失。
 
@@ -49,10 +70,13 @@ def l_h_anchor(student_layers, teacher_layers, kappa=0.1):
     d = student_layers[0].shape[-1]
     per_layer = []
     for h_s, h_t in zip(student_layers, teacher_layers):
-        p_s = lorentz_expmap(F.layer_norm(h_s.float(), (d,)), kappa)   # (T, d+1)
-        p_t = lorentz_expmap(F.layer_norm(h_t.float(), (d,)), kappa)
-        dist_sq = lorentz_dist(p_s, p_t, kappa) ** 2                   # (T,)
-        per_layer.append(dist_sq.mean())
+        u = F.layer_norm(h_s.float(), (d,))
+        v = F.layer_norm(h_t.float(), (d,))
+        dist_sq = lorentz_dist_tangent(u, v, kappa) ** 2               # (T,)
+        # 场景适配（披露）：dist^2 按 hidden_dim 归一。原论文 teacher/student 只差几个
+        # demo、表示很近；我们 teacher/student 的 prompt 内容不同（student 多 private 行），
+        # 4096 维距离^2 ~1e4 会把 λ·L_sup(~1) 淹没 4 个量级。除以 d 后与 sup 同量级。
+        per_layer.append(dist_sq.mean() / d)
     return torch.stack(per_layer).mean()
 
 
