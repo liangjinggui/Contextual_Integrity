@@ -1,17 +1,22 @@
 """把 HyperICLAdapter 接进冻结的 Qwen3：S~ = S + Diag(g)·Delta（式5，全层全头全行）。
 
-attach_adapter(model, rank) 给模型每一层的 self_attn 换上带偏置的 eager forward：
-q/k/v 的计算与 base 完全一样（QK-norm -> RoPE -> KV cache），唯一改动是打分后
-加上 adapter 的 g_i * Delta_i·。adapter 恒等初始化（U_k=0）时 Delta=0，前向与
-base 逐比特一致；adapter.enabled=False 是硬开关，同样精确回到 base。
+attach_adapter(model, rank) 给模型每一层的 self_attn 换上带偏置的 forward：
+q/k/v 的计算与 base 完全一样（QK-norm -> RoPE -> KV cache），打分与 softmax 交给
+F.scaled_dot_product_attention（SDPA）一次融合内核算完——式(5) 的 Diag(g)·Delta
+连同因果 mask 一起作为 additive attn_mask 传入，数学上与手写 eager 完全等价：
+    SDPA(q,k,v, attn_mask=B) == softmax(qk^T*scale + B) v
+（手写 eager 版生成时 36 层 x 每 token 十几个小算子，单 context ~8 分钟，不可用；
+SDPA 版一次内核，快一个量级。浮点求和顺序不同 -> 与 eager 数学相等但非逐比特。）
 
-生成时天然兼容 KV cache：decode 步 q 只有 1 个新 token，其 g 和 Delta 行现算，
-key 侧用 cache 里的全部 key。
+adapter 恒等初始化（U_k=0）时 bias 里只剩因果 mask，前向等价于 base；
+adapter.enabled=False 是硬开关。生成天然兼容 KV cache：decode 步 q 只有
+1 个新 token，其 g 和 Delta 行现算，key 侧用 cache 里的全部 key。
 """
 
 import types
 
 import torch
+import torch.nn.functional as F
 from transformers.models.qwen3.modeling_qwen3 import repeat_kv, apply_rotary_pos_emb
 
 from methods.hyper_icl.adapter import HyperICLAdapter
@@ -37,19 +42,19 @@ def _patched_forward(adapter, layer_idx):
         k_all = repeat_kv(k, self.num_key_value_groups)                            # (B, H, Tk, D)
         v_all = repeat_kv(v, self.num_key_value_groups)                            # (B, H, Tk, D)
 
-        # ---- 打分 + adapter 偏置（式5）----
-        scores = torch.matmul(q, k_all.transpose(-1, -2)) * self.scaling          # (B, H, T, Tk)
+        # ---- 组装加性 bias = 因果 mask + Diag(g)·Delta（式5）----
+        # attach_adapter 强制 eager 配置，HF 必给显式 4D float mask；若为 None 宁可
+        # 炸也不能静默双向（三跑教训）。
+        assert attention_mask is not None, "expected an explicit 4D causal mask (eager config)"
+        bias = attention_mask[:, :, :, : k_all.shape[-2]]                          # (B, 1, T, Tk)
         if adapter.enabled:
             delta, g = adapter(layer_idx, q, k_all)                # (B,H,T,Tk), (B,H,T)
-            scores = scores + g.unsqueeze(-1) * delta              # Diag(g)·Delta：第 i 行乘 g_i
-        if attention_mask is not None:
-            scores = scores + attention_mask[:, :, :, : k_all.shape[-2]]
+            bias = bias + g.unsqueeze(-1) * delta                  # Diag(g)·Delta：第 i 行乘 g_i
 
-        # ---- softmax / 输出：与 transformers eager 完全相同 ----
-        weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(weights, v_all)                                         # (B, H, T, D)
+        # ---- 一次 SDPA 融合内核：softmax(qk^T*scale + bias) v ----
+        out = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=bias, scale=self.scaling)
         out = out.transpose(1, 2).contiguous().reshape(B, T, -1)
-        return self.o_proj(out), weights
+        return self.o_proj(out), None
 
     return forward
 

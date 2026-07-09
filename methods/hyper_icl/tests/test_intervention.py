@@ -1,7 +1,8 @@
 """intervention 单测（tiny 随机 Qwen3, CPU）。
 
-闸门：adapter 恒等初始化（U_k=0）时，打补丁的模型必须与原始模型逐比特一致——
-前向 logits 和带 KV cache 的贪心生成都一致；U_k 随机化后输出必须改变（非空）。"""
+闸门：adapter 恒等初始化（U_k=0）时，打补丁的模型必须与原始模型等价——
+前向 logits allclose（补丁走 SDPA 融合内核，与 eager 数学相等、非逐比特），
+带 KV cache 的贪心生成逐 token 一致；U_k 随机化后输出必须改变（非空）。"""
 
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
@@ -33,7 +34,7 @@ def test_forward_identity_at_init():
     with torch.no_grad():
         out_base = base(ids).logits
         out_patched = patched(ids).logits
-    assert torch.equal(out_base, out_patched)
+    assert torch.allclose(out_base, out_patched, atol=1e-4, rtol=1e-4)
 
 
 def test_generate_identity_at_init():
@@ -69,7 +70,7 @@ def test_identity_with_default_attn_impl():
     attach_adapter(patched, rank=2)
     ids = torch.randint(0, 128, (1, 10))
     with torch.no_grad():
-        assert torch.equal(base(ids).logits, patched(ids).logits)
+        assert torch.allclose(base(ids).logits, patched(ids).logits, atol=1e-4, rtol=1e-4)
         gen_b = base.generate(ids, max_new_tokens=8, do_sample=False)
         gen_p = patched.generate(ids, max_new_tokens=8, do_sample=False)
     assert torch.equal(gen_b, gen_p)
@@ -85,4 +86,4 @@ def test_enabled_flag():
     with torch.no_grad():
         out_base = base(ids).logits
         out_patched = patched(ids).logits
-    assert torch.equal(out_base, out_patched)
+    assert torch.allclose(out_base, out_patched, atol=1e-4, rtol=1e-4)
