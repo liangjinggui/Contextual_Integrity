@@ -77,7 +77,9 @@ def l_h_anchor(student_layers, teacher_layers, kappa=0.1):
         # demo、表示很近；我们 teacher/student 的 prompt 内容不同（student 多 private 行），
         # 4096 维距离^2 ~1e4 会把 λ·L_sup(~1) 淹没 4 个量级。除以 d 后与 sup 同量级。
         per_layer.append(dist_sq.mean() / d)
-    return torch.stack(per_layer).mean()
+    # device_map 多卡下各层隐状态分居不同卡 -> 逐层标量先搬到同一张卡再 stack
+    dev0 = per_layer[0].device
+    return torch.stack([p.to(dev0) for p in per_layer]).mean()
 
 
 def l_sup(logits, labels):

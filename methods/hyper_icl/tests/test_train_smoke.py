@@ -15,14 +15,14 @@ PROMPTS = "data/CIMemories/eval/prompts.yaml"
 @pytest.mark.slow
 def test_train_smoke():
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-    model, adapter = load_patched_model("Qwen/Qwen3-8B", rank=4, device=DEV)
+    model, adapter, in_dev = load_patched_model("Qwen/Qwen3-8B", rank=4, device_map=DEV)
     ds = HyperICLDataset(TARGETS, tok, PROMPTS, num_profiles=1)
     opt = torch.optim.AdamW(adapter.parameters(), lr=5e-3)
 
     item = ds[0]
     losses = []
     for _ in range(3):
-        anchor, sup, loss = train_step(model, adapter, item, DEV, lam=0.5, kappa=0.1)
+        anchor, sup, loss = train_step(model, adapter, item, in_dev, lam=0.5, kappa=0.1)
         opt.zero_grad()
         loss.backward()
         opt.step()

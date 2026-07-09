@@ -20,15 +20,21 @@ from methods.hyper_icl.data import HyperICLDataset
 from methods.hyper_icl.losses import l_h_anchor, l_sup
 
 
-def load_patched_model(model_path, rank=4, device="cuda:0", dtype=torch.bfloat16):
-    """冻结 base + 挂 adapter；开 gradient checkpointing（全层 eager 反传的显存开销大）。"""
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation="eager").to(device)
+def load_patched_model(model_path, rank=4, device_map="cuda:0", dtype=torch.bfloat16):
+    """冻结 base + 挂 adapter；开 gradient checkpointing（全层 eager 反传的显存开销大）。
+
+    device_map: 'cuda:0' 整模型放可见的第一张卡（8B 单卡装得下，训练最快，默认）；
+    'auto' 按层切分铺满所有可见卡（仅模型单卡装不下时用，流水线式、更慢）。
+    返回 (model, adapter, in_dev)，in_dev = 输入张量该放的卡（嵌入层所在卡）。"""
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, dtype=dtype, attn_implementation="eager", device_map=device_map)
     adapter = attach_adapter(model, rank=rank)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     # HF 的 checkpointing 只在 training 模式下生效（eval 会存满 36 层 eager 权重矩阵 -> OOM）。
     # Qwen3 全是 RMSNorm 且 dropout=0，train 模式数值上与 eval 无差别。
     model.train()
-    return model, adapter
+    in_dev = model.get_input_embeddings().weight.device
+    return model, adapter, in_dev
 
 
 def train_step(model, adapter, item, device, lam, kappa):
@@ -65,13 +71,14 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-3)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--warmup_frac", type=float, default=0.1)
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device_map", default="cuda:0",
+                    help="'cuda:0' 单卡（默认，最快）；'auto' 模型装不下时按层铺满所有可见卡")
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--out", default="outputs/cimemories/ckpt/hyper_icl/hyper_icl_8b.pt")
     a = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(a.model_path)
-    model, adapter = load_patched_model(a.model_path, rank=a.rank, device=a.device)
+    model, adapter, in_dev = load_patched_model(a.model_path, rank=a.rank, device_map=a.device_map)
     ds = HyperICLDataset(a.targets_jsonl, tok, a.prompts_file, a.num_profiles, a.target_index)
     opt = torch.optim.AdamW(adapter.parameters(), lr=a.lr)
     total = a.epochs * len(ds)
@@ -90,7 +97,7 @@ def main():
     for ep in range(a.epochs):
         sum_anchor = sum_sup = 0.0
         for i, item in enumerate(ds, 1):
-            anchor, sup, loss = train_step(model, adapter, item, a.device, a.lam, a.kappa)
+            anchor, sup, loss = train_step(model, adapter, item, in_dev, a.lam, a.kappa)
             opt.zero_grad()
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)

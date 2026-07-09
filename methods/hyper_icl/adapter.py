@@ -35,15 +35,18 @@ class HyperICLAdapter(nn.Module):
         k: (B, H, Tk, D)  该层各头的 key（GQA 需先 repeat_kv 到 H 个头）
         返回 delta: (B, H, Tq, Tk)，g: (B, H, Tq)
         """
+        # 多卡 device_map 下各层分居不同卡：把当层参数搬到 q 所在的卡
+        # （每层仅 ~几十 KB；同卡时 .to 是 no-op 零开销）
+        dev = q.device
         # ---- Delta = (q U_q)(k U_k)^T / sqrt(r)，式(6-7) ----
-        q_low = q @ self.U_q[layer]                            # (B, H, Tq, r)
-        k_low = k @ self.U_k[layer]                            # (B, H, Tk, r)
+        q_low = q @ self.U_q[layer].to(dev)                    # (B, H, Tq, r)
+        k_low = k @ self.U_k[layer].to(dev)                    # (B, H, Tk, r)
         delta = q_low @ k_low.transpose(-1, -2)                # (B, H, Tq, Tk)
         delta = delta / math.sqrt(self.rank)
 
         # ---- g = sigmoid( LN(q)·w + b )，式(9) ----
         q_norm = F.layer_norm(q, (self.head_dim,))             # LN 只归一化，无可学参数
-        w = self.w[layer].unsqueeze(1)                         # (H, 1, D)，与 (B,H,Tq,D) 广播
-        b = self.b[layer].unsqueeze(-1)                        # (H, 1)
+        w = self.w[layer].to(dev).unsqueeze(1)                 # (H, 1, D)，与 (B,H,Tq,D) 广播
+        b = self.b[layer].to(dev).unsqueeze(-1)                # (H, 1)
         g = torch.sigmoid((q_norm * w).sum(-1) + b)            # (B, H, Tq)
         return delta, g

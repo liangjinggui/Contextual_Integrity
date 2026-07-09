@@ -31,7 +31,8 @@ def main():
     ap.add_argument("--results_dir", required=True)
     ap.add_argument("--prompts_file", required=True)
     ap.add_argument("--privacy_prompts_level", type=int, default=1)
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device_map", default="auto",
+                    help="'auto' 把模型铺满所有可见 GPU；'sequential' 先填满第一张再溢出")
     ap.add_argument("--batch_size", type=int, default=4, help="全层 eager 注意力显存高，默认取小")
     ap.add_argument("--max_new_tokens", type=int, default=1024)
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -45,13 +46,16 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(a.model_path, dtype=torch.bfloat16, attn_implementation="eager").to(a.device)
+    model = AutoModelForCausalLM.from_pretrained(
+        a.model_path, dtype=torch.bfloat16, attn_implementation="eager", device_map=a.device_map)
     model.eval()
-    adapter = attach_adapter(model, rank=a.rank)
+    print("[gen-hyper] device_map:", getattr(model, "hf_device_map", None), flush=True)
+    in_dev = model.get_input_embeddings().weight.device      # 输入要放的卡
+    adapter = attach_adapter(model, rank=a.rank)             # forward 内部会把参数搬到各层所在卡
     if a.disable_adapter:
         adapter.enabled = False
     elif a.ckpt:
-        adapter.load_state_dict(torch.load(a.ckpt, map_location=a.device))
+        adapter.load_state_dict(torch.load(a.ckpt, map_location="cpu"))
     else:
         raise SystemExit("pass --ckpt <path> or --disable_adapter")
 
@@ -98,7 +102,7 @@ def main():
     done = 0
     for b, i in enumerate(range(0, len(jobs), a.batch_size)):
         batch = jobs[i:i + a.batch_size]
-        enc = tok([chat for (_, _, chat) in batch], return_tensors="pt", padding=True).to(a.device)
+        enc = tok([chat for (_, _, chat) in batch], return_tensors="pt", padding=True).to(in_dev)
         with torch.no_grad():
             out = model.generate(
                 **enc, max_new_tokens=a.max_new_tokens, do_sample=True,
