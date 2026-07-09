@@ -59,6 +59,10 @@ def attach_adapter(model, rank=4):
 
     base 权重全部冻结；只有返回的 adapter 含可训练参数。"""
     cfg = model.config
+    # 必须强制 eager：sdpa 配置下 HF 对无 padding 输入给 attention_mask=None（SDPA 内部
+    # 用 is_causal 标志），我们的 forward 就没有因果掩码 -> 双向注意力（信件 token 能看
+    # 到未来，teacher-forcing 变抄答案）。eager 配置保证 HF 总是准备显式 4D 因果掩码。
+    cfg._attn_implementation = "eager"
     layers = model.model.layers
     adapter = HyperICLAdapter(
         n_layers=len(layers), n_heads=cfg.num_attention_heads,

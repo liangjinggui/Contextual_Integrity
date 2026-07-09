@@ -57,6 +57,24 @@ def test_random_Uk_changes_output():
     assert not torch.equal(out_base, out_patched)
 
 
+def test_identity_with_default_attn_impl():
+    """回归（真实翻车场景）：patched 模型不手动设 eager（默认 sdpa 时 HF 给
+    attention_mask=None -> 补丁里没有因果掩码 -> 双向注意力、信件 token 看到未来）。
+    attach_adapter 内部必须强制 eager，保证任何加载方式下 identity 都成立。"""
+    torch.manual_seed(0)
+    base = Qwen3ForCausalLM(TINY).eval()
+    base.config._attn_implementation = "eager"
+    patched = Qwen3ForCausalLM(TINY).eval()          # 不设 _attn_implementation，走默认
+    patched.load_state_dict(base.state_dict())
+    attach_adapter(patched, rank=2)
+    ids = torch.randint(0, 128, (1, 10))
+    with torch.no_grad():
+        assert torch.equal(base(ids).logits, patched(ids).logits)
+        gen_b = base.generate(ids, max_new_tokens=8, do_sample=False)
+        gen_p = patched.generate(ids, max_new_tokens=8, do_sample=False)
+    assert torch.equal(gen_b, gen_p)
+
+
 def test_enabled_flag():
     """enabled=False 时即使 U_k 随机也精确回到 base（硬开关）。"""
     base, patched, adapter = make_pair()

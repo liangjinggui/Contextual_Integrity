@@ -22,7 +22,7 @@ from methods.hyper_icl.losses import l_h_anchor, l_sup
 
 def load_patched_model(model_path, rank=4, device="cuda:0", dtype=torch.bfloat16):
     """冻结 base + 挂 adapter；开 gradient checkpointing（全层 eager 反传的显存开销大）。"""
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation="eager").to(device)
     adapter = attach_adapter(model, rank=rank)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     # HF 的 checkpointing 只在 training 模式下生效（eval 会存满 36 层 eager 权重矩阵 -> OOM）。
@@ -111,8 +111,12 @@ def main():
                       f"{hms(elapsed)} elapsed | ETA {hms(eta)}", flush=True)
         print(f"[train] == epoch {ep+1}/{a.epochs} done | mean anchor {sum_anchor/len(ds):.4f} "
               f"sup {sum_sup/len(ds):.4f} | {hms(time.time()-t0)} elapsed ==", flush=True)
+        # 论文按 best-performing epoch 报告 -> 每个 epoch 都存，评测时可选
+        os.makedirs(os.path.dirname(a.out), exist_ok=True)
+        ep_path = a.out.replace(".pt", f"_ep{ep+1}.pt")
+        torch.save(adapter.state_dict(), ep_path)
+        print(f"[train] saved {ep_path}", flush=True)
 
-    os.makedirs(os.path.dirname(a.out), exist_ok=True)
     torch.save(adapter.state_dict(), a.out)
     print(f"[train] saved {a.out} | total {hms(time.time()-t0)}", flush=True)
 
