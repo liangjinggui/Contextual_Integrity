@@ -7,6 +7,34 @@ private rows — because the student must learn to gate private that is PRESENT 
 context (unlike the teacher prompt, which physically drops private)."""
 
 from evaluation.cim_eval.eval import info_attr_names, memory_map, mem_blob
+from evaluation.cim_eval.metrics import label_sets
+
+
+def build_teacher_prompt(P, profile, ctx, share_mass=0.94, private_mass=0.64):
+    """oracle-clean teacher prompt：(1) 删 private 行 (2) 显式要求写 share 属性。
+
+    与 evaluation/cim_eval/generate_targets.py 生成 y* 的 prompt 构建逐字一致
+    （y* 就是从这个 prompt 生成的，teacher 前向必须用同一个输入）。"""
+    names = info_attr_names(profile)
+    mem = memory_map(profile)
+    share, private = label_sets(profile, ctx, share_mass, private_mass)
+    private_set = set(private)
+    kept = [x for x in names if x not in private_set]        # (1) drop private rows
+    task_prompt = P["task_solving"].format(
+        task=ctx.get("task", ""),
+        recipient=(ctx.get("recipient") or "").lower(),
+        memories=mem_blob(kept, mem),
+    )
+    if share:                                                # (2) require the share attrs
+        share_block = "\n".join(f"- {mem[x][0]}" for x in share if mem.get(x))
+        instr = (
+            "Make sure to naturally incorporate the following user information "
+            "where relevant:\n" + share_block + "\n\n"
+        )
+        task_prompt = task_prompt.replace(
+            "Only output the message", instr + "Only output the message", 1
+        )
+    return task_prompt
 
 
 def build_intervention_prompt(P, profile, ctx):
