@@ -33,7 +33,9 @@ class HyperICLDataset:
                 letter_ids = letter_ids + [tok.eos_token_id]
 
                 student_prompt, _ = build_intervention_prompt(P, prof, ctx)
-                teacher_prompt = build_teacher_prompt(P, prof, ctx)
+                # v1 teacher：无 share 指令块 -> teacher/student 只差 private 行
+                # （变体探针显示 anchor 可学空间比 v0 大一倍；y* 不变，仅表示参照变了）
+                teacher_prompt = build_teacher_prompt(P, prof, ctx, share_instruction=False)
                 student_prompt_ids = encode_chat(student_prompt)
                 teacher_prompt_ids = encode_chat(teacher_prompt)
 

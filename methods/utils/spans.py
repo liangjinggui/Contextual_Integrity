@@ -10,11 +10,13 @@ from evaluation.cim_eval.eval import info_attr_names, memory_map, mem_blob
 from evaluation.cim_eval.metrics import label_sets
 
 
-def build_teacher_prompt(P, profile, ctx, share_mass=0.94, private_mass=0.64):
+def build_teacher_prompt(P, profile, ctx, share_mass=0.94, private_mass=0.64,
+                         share_instruction=True):
     """oracle-clean teacher prompt：(1) 删 private 行 (2) 显式要求写 share 属性。
 
-    与 evaluation/cim_eval/generate_targets.py 生成 y* 的 prompt 构建逐字一致
-    （y* 就是从这个 prompt 生成的，teacher 前向必须用同一个输入）。"""
+    share_instruction=True（v0）与 evaluation/cim_eval/generate_targets.py 生成 y*
+    的 prompt 逐字一致；=False（v1）去掉 share 指令块——teacher 与 student 的差异
+    只剩 private 行本身（anchor 可学空间更大，见 hyper-icl plan 的变体探针）。"""
     names = info_attr_names(profile)
     mem = memory_map(profile)
     share, private = label_sets(profile, ctx, share_mass, private_mass)
@@ -25,7 +27,7 @@ def build_teacher_prompt(P, profile, ctx, share_mass=0.94, private_mass=0.64):
         recipient=(ctx.get("recipient") or "").lower(),
         memories=mem_blob(kept, mem),
     )
-    if share:                                                # (2) require the share attrs
+    if share and share_instruction:                          # (2) require the share attrs
         share_block = "\n".join(f"- {mem[x][0]}" for x in share if mem.get(x))
         instr = (
             "Make sure to naturally incorporate the following user information "
