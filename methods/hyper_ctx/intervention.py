@@ -16,6 +16,7 @@ import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.models.qwen3.modeling_qwen3 import repeat_kv, apply_rotary_pos_emb
 
 from methods.hyper_ctx.hypernet import CtxHyperNet
@@ -112,7 +113,13 @@ def _patched_forward(adapter, layer_idx):
             g = adapter.gate(q, layer_idx)                     # (B, H, T)
             bias = bias + g.unsqueeze(-1) * delta
 
-        out = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=bias, scale=self.scaling)
+        if bias.requires_grad:
+            # 训练:efficient 后端对带梯度的 attn_mask 反传有 LSE 对齐 bug -> 用 math 后端
+            # (数学等价的朴素矩阵实现;生成 no_grad 不进这支,照旧走高效内核)
+            with sdpa_kernel([SDPBackend.MATH]):
+                out = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=bias, scale=self.scaling)
+        else:
+            out = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=bias, scale=self.scaling)
         out = out.transpose(1, 2).contiguous().reshape(B, T, -1)
         return self.o_proj(out), None
 
