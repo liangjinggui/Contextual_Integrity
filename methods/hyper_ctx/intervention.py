@@ -58,18 +58,19 @@ class CtxAdapter(nn.Module):
         """返回该层的 (U_q, U_k), 各 (B, H, D, r);无 span 时返回 None(走纯 base)。"""
         if self._instr_span is None:
             return None
-        gd = self.gtheta.head.weight.dtype
+        gw = self.gtheta.head.weight
+        gd, gdev = gw.dtype, gw.device            # 多卡切分时后半段层的 c 在别的卡, 搬到 Gθ 的卡
         if self._gen_mode:
             T = hidden_states.shape[1]
             if T > 1:                                          # prefill:算一次并缓存
                 i0, i1 = self._instr_span
                 c = hidden_states[:, i0:i1, :].mean(1)         # (B, hidden)
-                self._U_cache[layer_idx] = self.gtheta(c.to(gd), layer_idx)
+                self._U_cache[layer_idx] = self.gtheta(c.to(device=gdev, dtype=gd), layer_idx)
                 return self._U_cache[layer_idx]
             return self._U_cache.get(layer_idx)                # decode:复用(未缓存则 None)
         i0, i1 = self._instr_span                              # 训练:就地现算
         c = hidden_states[:, i0:i1, :].mean(1)
-        return self.gtheta(c.to(gd), layer_idx)
+        return self.gtheta(c.to(device=gdev, dtype=gd), layer_idx)
 
     def gate(self, q, layer_idx):
         """g = sigmoid(LN(q)·w + b): (B, H, T)。w/b 是静态参数(与 hyper_icl 相同)。"""
@@ -106,7 +107,8 @@ def _patched_forward(adapter, layer_idx):
         U = adapter.get_U(hidden_states, layer_idx) if adapter.enabled else None
         if U is not None:
             U_q, U_k = U                                       # 各 (B, H, D, r)
-            U_q, U_k = U_q.to(q.dtype), U_k.to(q.dtype)
+            U_q = U_q.to(device=q.device, dtype=q.dtype)       # Gθ 在首卡, U 搬回本层所在卡
+            U_k = U_k.to(device=q.device, dtype=q.dtype)
             q_low = q @ U_q                                    # (B, H, T,  r)
             k_low = k_all @ U_k                                # (B, H, Tk, r)
             delta = q_low @ k_low.transpose(-1, -2) / math.sqrt(adapter.rank)      # (B, H, T, Tk)
